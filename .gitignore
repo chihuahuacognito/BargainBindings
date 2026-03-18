@@ -1,0 +1,7 @@
+.next
+node_modules
+*.log
+book-pricing.db
+book-pricing.db-shm
+book-pricing.db-wal
+.env.local
