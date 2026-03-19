@@ -7,6 +7,8 @@ import { crosswordScraper } from "@/lib/scrapers/crossword";
 import { flipkartScraper } from "@/lib/scrapers/flipkart";
 import { gyaanstoreScraper } from "@/lib/scrapers/gyaanstore";
 import { kitabayScraper } from "@/lib/scrapers/kitabay";
+import { odysseyScraper } from "@/lib/scrapers/odyssey";
+import { pustakaScraper } from "@/lib/scrapers/pustaka";
 import { sapnaonlineScraper } from "@/lib/scrapers/sapnaonline";
 import type { CanonicalBook, StoreName, StoreOffer } from "@/lib/types";
 import { STORE_NAMES } from "@/lib/stores";
@@ -20,6 +22,8 @@ const scrapers = {
   bookswagon: bookswagonScraper,
   gyaanstore: gyaanstoreScraper,
   kitabay: kitabayScraper,
+  pustaka: pustakaScraper,
+  odyssey: odysseyScraper,
 };
 
 export async function getOffers({

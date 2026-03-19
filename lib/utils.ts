@@ -72,6 +72,25 @@ export function bestQueryForBook(book: CanonicalBook): string {
   return book.isbn13 ?? [book.title, book.authors[0]].filter(Boolean).join(" ");
 }
 
+export function detectEditionType(
+  title: string,
+  subtitle: string | null,
+  publisher: string | null,
+): import("@/lib/types").EditionType {
+  const corpus = [title, subtitle, publisher].filter(Boolean).join(" ");
+
+  if (/audiobook|audio\s*book|brilliance\s*audio|audible|audio\s*cd/i.test(corpus)) return "audiobook";
+  if (/kindle|ebook|e-book|e\s*book|digital\s*edition|epub/i.test(corpus)) return "ebook";
+  if (/box\s*set|boxed\s*set|omnibus|complete\s*(works|series|collection)|collected\s*edition/i.test(corpus)) return "box-set";
+  if (/illustrat/i.test(corpus)) return "illustrated";
+  if (/hardcover|hardback|hard\s*cover|cased\s*edition/i.test(corpus)) return "hardcover";
+  if (/mass\s*market/i.test(corpus)) return "mass-market";
+  if (/trade\s*paper/i.test(corpus)) return "trade-paperback";
+  if (/paperback|softcover|soft\s*cover/i.test(corpus)) return "paperback";
+
+  return "unknown";
+}
+
 export function scoreCandidate({
   book,
   candidateTitle,

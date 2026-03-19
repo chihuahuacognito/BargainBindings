@@ -9,6 +9,8 @@ export const STORE_NAMES: StoreName[] = [
   "bookswagon",
   "gyaanstore",
   "kitabay",
+  "pustaka",
+  "odyssey",
 ];
 
 export const STORE_LABELS: Record<StoreName, string> = {
@@ -20,6 +22,8 @@ export const STORE_LABELS: Record<StoreName, string> = {
   bookswagon: "Bookswagon",
   gyaanstore: "Gyaanstore",
   kitabay: "Kitabay",
+  pustaka: "Pustaka.in",
+  odyssey: "OdysseyIndia",
 };
 
 export function isStoreName(value: string | null | undefined): value is StoreName {

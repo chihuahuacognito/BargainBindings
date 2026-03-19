@@ -38,7 +38,7 @@ export async function fetchText(url: string, key: string): Promise<string> {
   return response.text();
 }
 
-export async function fetchJson<T>(url: string, key: string): Promise<T> {
+export async function fetchJson<T>(url: string, key: string, retries = 2): Promise<T> {
   await throttle(key);
 
   const response = await fetch(url, {
@@ -48,6 +48,12 @@ export async function fetchJson<T>(url: string, key: string): Promise<T> {
     },
     cache: "no-store",
   });
+
+  if (response.status === 429 && retries > 0) {
+    const retryAfter = Number(response.headers.get("Retry-After") ?? 2);
+    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+    return fetchJson<T>(url, key, retries - 1);
+  }
 
   if (!response.ok) {
     throw new Error(`fetch_failed:${response.status}`);

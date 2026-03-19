@@ -1,5 +1,14 @@
 import Database from "better-sqlite3";
-import type { CanonicalBook, ScrapeStatus, StoreName, StoreOffer } from "@/lib/types";
+import type {
+  CanonicalBook,
+  PriceHistoryPoint,
+  ReadingListEntry,
+  ReadingShelf,
+  ScrapeStatus,
+  StoreName,
+  StoreOffer,
+  TrendingBook,
+} from "@/lib/types";
 
 const databasePath = "book-pricing.db";
 type SqliteDatabase = ReturnType<typeof createDatabase>;
@@ -48,6 +57,49 @@ function createDatabase() {
       status TEXT NOT NULL,
       message TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS price_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      book_id TEXT NOT NULL,
+      store TEXT NOT NULL,
+      price_inr REAL,
+      in_stock INTEGER,
+      checked_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ph_book_store
+      ON price_history(book_id, store, checked_at);
+
+    CREATE TABLE IF NOT EXISTS reading_list (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      google_book_id TEXT,
+      book_id TEXT,
+      shelf TEXT NOT NULL DEFAULT 'to-read',
+      date_added TEXT NOT NULL,
+      date_started TEXT,
+      date_finished TEXT,
+      notes TEXT,
+      target_price REAL,
+      raw_title TEXT,
+      raw_author TEXT,
+      raw_isbn TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rl_google_book
+      ON reading_list(google_book_id)
+      WHERE google_book_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS trending_books (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rank INTEGER NOT NULL,
+      category TEXT NOT NULL DEFAULT 'all',
+      google_book_id TEXT,
+      book_id TEXT,
+      raw_title TEXT NOT NULL,
+      raw_author TEXT,
+      raw_isbn TEXT,
+      scraped_at TEXT NOT NULL
     );
   `);
 
@@ -133,6 +185,20 @@ export function getOffersForBook(bookId: string): StoreOffer[] {
 export function upsertOffer(offer: StoreOffer, logMessage: string) {
   const db = getDb();
 
+  // Append to price history before overwriting the latest offer
+  if (offer.priceInr !== null || offer.status === "ok") {
+    db.prepare(
+      `INSERT INTO price_history (book_id, store, price_inr, in_stock, checked_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      offer.bookId,
+      offer.store,
+      offer.priceInr,
+      offer.inStock === null ? null : offer.inStock ? 1 : 0,
+      new Date().toISOString(),
+    );
+  }
+
   db.prepare(
     `
       INSERT INTO store_offers (
@@ -168,4 +234,276 @@ export function upsertOffer(offer: StoreOffer, logMessage: string) {
       VALUES (?, ?, ?, ?, ?)
     `,
   ).run(offer.bookId, offer.store, offer.status, logMessage, new Date().toISOString());
+}
+
+export function getOfferHistory(bookId: string, store?: StoreName, limitDays = 30): PriceHistoryPoint[] {
+  const db = getDb();
+  const cutoff = new Date(Date.now() - limitDays * 24 * 60 * 60 * 1000).toISOString();
+
+  const rows = store
+    ? (db
+        .prepare(
+          `SELECT store, price_inr, in_stock, checked_at FROM price_history
+           WHERE book_id = ? AND store = ? AND checked_at >= ?
+           ORDER BY checked_at ASC`,
+        )
+        .all(bookId, store, cutoff) as Array<Record<string, unknown>>)
+    : (db
+        .prepare(
+          `SELECT store, price_inr, in_stock, checked_at FROM price_history
+           WHERE book_id = ? AND checked_at >= ?
+           ORDER BY checked_at ASC`,
+        )
+        .all(bookId, cutoff) as Array<Record<string, unknown>>);
+
+  return rows.map((row) => ({
+    store: row.store as StoreName,
+    priceInr: typeof row.price_inr === "number" ? row.price_inr : null,
+    inStock: typeof row.in_stock === "number" ? row.in_stock === 1 : null,
+    checkedAt: String(row.checked_at),
+  }));
+}
+
+// ── Reading List ───────────────────────────────────────────────────────────
+
+function getBestPricesForBooks(bookIds: string[]): Map<string, { priceInr: number; store: StoreName }> {
+  if (bookIds.length === 0) return new Map();
+  const db = getDb();
+  const placeholders = bookIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT book_id, store, price_inr FROM store_offers
+       WHERE price_inr IS NOT NULL AND book_id IN (${placeholders})
+       ORDER BY price_inr ASC`,
+    )
+    .all(...bookIds) as Array<{ book_id: string; store: string; price_inr: number }>;
+
+  const result = new Map<string, { priceInr: number; store: StoreName }>();
+  for (const row of rows) {
+    if (!result.has(row.book_id)) {
+      result.set(row.book_id, { priceInr: row.price_inr, store: row.store as StoreName });
+    }
+  }
+  return result;
+}
+
+export function getReadingList(shelf?: ReadingShelf): ReadingListEntry[] {
+  const db = getDb();
+
+  const query = shelf
+    ? `SELECT rl.*, b.title, b.authors_json, b.isbn10, b.isbn13, b.thumbnail, b.publisher
+       FROM reading_list rl
+       LEFT JOIN books b ON b.id = rl.book_id
+       WHERE rl.shelf = ?
+       ORDER BY rl.date_added DESC`
+    : `SELECT rl.*, b.title, b.authors_json, b.isbn10, b.isbn13, b.thumbnail, b.publisher
+       FROM reading_list rl
+       LEFT JOIN books b ON b.id = rl.book_id
+       ORDER BY rl.date_added DESC`;
+
+  const rows = (shelf ? db.prepare(query).all(shelf) : db.prepare(query).all()) as Array<Record<string, unknown>>;
+
+  const bookIds = rows.map((r) => r.book_id as string).filter(Boolean);
+  const bestPrices = getBestPricesForBooks(bookIds);
+
+  return rows.map((row) => {
+    const bookId = (row.book_id as string | null) ?? null;
+    const best = bookId ? bestPrices.get(bookId) : undefined;
+    let authors: string[] = [];
+    try {
+      if (row.authors_json) authors = JSON.parse(row.authors_json as string) as string[];
+    } catch {
+      authors = [];
+    }
+    return {
+      id: row.id as number,
+      shelf: (row.shelf as ReadingShelf) ?? "to-read",
+      dateAdded: String(row.date_added),
+      dateStarted: (row.date_started as string | null) ?? null,
+      dateFinished: (row.date_finished as string | null) ?? null,
+      notes: (row.notes as string | null) ?? null,
+      targetPrice: typeof row.target_price === "number" ? row.target_price : null,
+      rawTitle: (row.raw_title as string | null) ?? null,
+      rawAuthor: (row.raw_author as string | null) ?? null,
+      rawIsbn: (row.raw_isbn as string | null) ?? null,
+      googleBookId: (row.google_book_id as string | null) ?? null,
+      bookId,
+      title: (row.title as string | null) ?? null,
+      authors,
+      isbn13: (row.isbn13 as string | null) ?? null,
+      isbn10: (row.isbn10 as string | null) ?? null,
+      thumbnail: (row.thumbnail as string | null) ?? null,
+      publisher: (row.publisher as string | null) ?? null,
+      bestPriceInr: best?.priceInr ?? null,
+      bestPriceStore: best?.store ?? null,
+    };
+  });
+}
+
+export function addToReadingList(entry: {
+  googleBookId?: string | null;
+  bookId?: string | null;
+  shelf?: ReadingShelf;
+  rawTitle?: string | null;
+  rawAuthor?: string | null;
+  rawIsbn?: string | null;
+}): number | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO reading_list (google_book_id, book_id, shelf, date_added, raw_title, raw_author, raw_isbn)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.googleBookId ?? null,
+        entry.bookId ?? null,
+        entry.shelf ?? "to-read",
+        now,
+        entry.rawTitle ?? null,
+        entry.rawAuthor ?? null,
+        entry.rawIsbn ?? null,
+      );
+    return result.lastInsertRowid as number;
+  } catch {
+    // Duplicate google_book_id — already in list
+    return null;
+  }
+}
+
+export function updateReadingListEntry(
+  id: number,
+  updates: {
+    shelf?: ReadingShelf;
+    notes?: string | null;
+    targetPrice?: number | null;
+    dateStarted?: string | null;
+    dateFinished?: string | null;
+  },
+) {
+  const db = getDb();
+  db.prepare(
+    `UPDATE reading_list SET
+       shelf = COALESCE(@shelf, shelf),
+       notes = @notes,
+       target_price = @targetPrice,
+       date_started = @dateStarted,
+       date_finished = @dateFinished
+     WHERE id = @id`,
+  ).run({
+    id,
+    shelf: updates.shelf ?? null,
+    notes: updates.notes ?? null,
+    targetPrice: updates.targetPrice ?? null,
+    dateStarted: updates.dateStarted ?? null,
+    dateFinished: updates.dateFinished ?? null,
+  });
+}
+
+export function removeFromReadingList(id: number) {
+  const db = getDb();
+  db.prepare(`DELETE FROM reading_list WHERE id = ?`).run(id);
+}
+
+// ── Trending Books ─────────────────────────────────────────────────────────
+
+export function getTrendingBooks(category?: string, limit = 20): TrendingBook[] {
+  const db = getDb();
+
+  const query = category && category !== "all"
+    ? `SELECT tb.*, b.title, b.authors_json, b.isbn13, b.thumbnail
+       FROM trending_books tb
+       LEFT JOIN books b ON b.id = tb.book_id
+       WHERE tb.category = ?
+       ORDER BY tb.rank ASC
+       LIMIT ?`
+    : `SELECT tb.*, b.title, b.authors_json, b.isbn13, b.thumbnail
+       FROM trending_books tb
+       LEFT JOIN books b ON b.id = tb.book_id
+       WHERE tb.category = 'all'
+       ORDER BY tb.rank ASC
+       LIMIT ?`;
+
+  const rows = (
+    category && category !== "all"
+      ? db.prepare(query).all(category, limit)
+      : db.prepare(query).all(limit)
+  ) as Array<Record<string, unknown>>;
+
+  const bookIds = rows.map((r) => r.book_id as string).filter(Boolean);
+  const bestPrices = getBestPricesForBooks(bookIds);
+
+  return rows.map((row) => {
+    const bookId = (row.book_id as string | null) ?? null;
+    const best = bookId ? bestPrices.get(bookId) : undefined;
+    let authors: string[] = [];
+    try {
+      if (row.authors_json) authors = JSON.parse(row.authors_json as string) as string[];
+    } catch {
+      authors = [];
+    }
+    return {
+      rank: row.rank as number,
+      category: String(row.category),
+      rawTitle: String(row.raw_title),
+      rawAuthor: (row.raw_author as string | null) ?? null,
+      googleBookId: (row.google_book_id as string | null) ?? null,
+      bookId,
+      scrapedAt: String(row.scraped_at),
+      title: (row.title as string | null) ?? null,
+      authors,
+      thumbnail: (row.thumbnail as string | null) ?? null,
+      isbn13: (row.isbn13 as string | null) ?? null,
+      bestPriceInr: best?.priceInr ?? null,
+      bestPriceStore: best?.store ?? null,
+    };
+  });
+}
+
+export function upsertTrendingBooks(
+  books: Array<{
+    rank: number;
+    category: string;
+    googleBookId?: string | null;
+    bookId?: string | null;
+    rawTitle: string;
+    rawAuthor?: string | null;
+    rawIsbn?: string | null;
+  }>,
+) {
+  if (books.length === 0) return;
+  const db = getDb();
+  const category = books[0]!.category;
+  const now = new Date().toISOString();
+
+  const deleteAndInsert = db.transaction(() => {
+    db.prepare(`DELETE FROM trending_books WHERE category = ?`).run(category);
+    const insert = db.prepare(
+      `INSERT INTO trending_books (rank, category, google_book_id, book_id, raw_title, raw_author, raw_isbn, scraped_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const book of books) {
+      insert.run(
+        book.rank,
+        book.category,
+        book.googleBookId ?? null,
+        book.bookId ?? null,
+        book.rawTitle,
+        book.rawAuthor ?? null,
+        book.rawIsbn ?? null,
+        now,
+      );
+    }
+  });
+
+  deleteAndInsert();
+}
+
+export function getLatestTrendingScrapeTime(category = "all"): string | null {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT scraped_at FROM trending_books WHERE category = ? ORDER BY scraped_at DESC LIMIT 1`)
+    .get(category) as { scraped_at: string } | undefined;
+  return row?.scraped_at ?? null;
 }
